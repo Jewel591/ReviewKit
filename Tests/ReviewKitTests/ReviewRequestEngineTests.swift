@@ -132,10 +132,21 @@ struct ReviewRequestEngineTests {
         #expect(engine.canRequestNow())
     }
 
-    @Test func canRequestNowSkipsMonotonicConditions() {
-        // A session-count gate does not revalidate at request time even if its
-        // threshold would fail against a hypothetical reset.
+    @Test func canRequestNowIsFalseWithoutEstablishedEligibility() {
+        // canRequestNow is a revalidation, not an independent decision: it
+        // must never approve a request eligibility hasn't approved first.
         let engine = makeEngine(conditions: [MinimumSessionsCondition(sessions: 99)])
+        #expect(!engine.canRequestNow())
+    }
+
+    @Test func canRequestNowSkipsMonotonicConditionsOnceEligible() {
+        let store = InMemoryStore()
+        let engine = makeEngine(
+            conditions: [MinimumSessionsCondition(sessions: 1)], store: store)
+        engine.recordSession()
+        #expect(engine.isEligible)
+        // Monotonic gates are not re-run at request time; with no
+        // revalidating conditions configured, the check passes outright.
         #expect(engine.canRequestNow())
     }
 

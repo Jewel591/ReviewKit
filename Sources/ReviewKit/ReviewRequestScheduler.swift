@@ -93,7 +93,12 @@ public final class ReviewRequestScheduler {
 
             await sleep(configuration.initialDelay)
 
-            for attempt in 0...configuration.maxRetries {
+            // Negative values would make the ClosedRange below trap; treat
+            // them as "no retries" instead of crashing at a distance from
+            // where the configuration was built.
+            let maxRetries = max(0, configuration.maxRetries)
+
+            for attempt in 0...maxRetries {
                 guard !Task.isCancelled, shouldRequest() else { return }
 
                 if !isBlocked(), !hasBlockingPresentation(), canRequestNow() {
@@ -101,7 +106,7 @@ public final class ReviewRequestScheduler {
                     return
                 }
 
-                guard attempt < configuration.maxRetries else { return }
+                guard attempt < maxRetries else { return }
                 await sleep(configuration.retryInterval)
             }
         }

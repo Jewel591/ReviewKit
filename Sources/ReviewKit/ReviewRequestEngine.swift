@@ -106,10 +106,14 @@ public final class ReviewRequestEngine {
 
     /// Final check at the moment of the actual `requestReview()` call.
     ///
-    /// Eligibility and firing can be arbitrarily far apart (the pending flag
-    /// persists across launches), so every condition that declared
-    /// `revalidatesAtRequestTime` is re-run against a fresh context.
+    /// Requires established eligibility — this is a *revalidation*, not an
+    /// independent decision, so it can never approve a request that
+    /// ``evaluateEligibility()`` has not approved first. On top of that,
+    /// every condition that declared `revalidatesAtRequestTime` is re-run
+    /// against a fresh context, because eligibility and firing can be
+    /// arbitrarily far apart (the pending flag persists across launches).
     public func canRequestNow() -> Bool {
+        guard isEligible else { return false }
         let context = makeContext()
         for condition in conditions where condition.revalidatesAtRequestTime {
             let verdict = condition.evaluate(context)

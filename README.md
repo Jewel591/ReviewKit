@@ -56,27 +56,31 @@ are for.
 
 ## Usage
 
+Apps should use `StandardReviewPolicy` — one house-standard rule set (7 days
+since install, 5 sessions, 10 core events, 120-day cooldown, once per
+version). An app supplies exactly two things: the name of its core "win"
+event, and its app-specific suppressors. Threshold changes are portfolio-wide
+policy decisions made inside the kit, not per-app tweaks.
+
 ```swift
 import ReviewKit
 
 @MainActor
 enum ReviewPrompt {
     static let engine = ReviewRequestEngine(
-        conditions: [
-            MinimumSessionsCondition(sessions: 5),
-            MinimumSignificantEventsCondition(count: 10, event: "recordSaved"),
-            MinimumDaysSinceInstallCondition(days: 7),
-            CooldownCondition(days: 120),
-            NotRequestedForCurrentVersionCondition(),
-            QuietPeriodCondition(
-                identifier: "quietPeriod(marketingPrompt)",
-                quietInterval: 24 * 3600,
-                lastEventDate: { MarketingPrompts.lastShownDate }
-            ),
-            CustomReviewCondition(identifier: "noRecentCrash") { _ in
-                !CrashState.crashedLastLaunch
-            },
-        ],
+        conditions: StandardReviewPolicy.conditions(
+            coreEvent: "recordSaved",
+            suppressors: [
+                QuietPeriodCondition(
+                    identifier: "quietPeriod(marketingPrompt)",
+                    quietInterval: 24 * 3600,
+                    lastEventDate: { MarketingPrompts.lastShownDate }
+                ),
+                CustomReviewCondition(identifier: "noRecentCrash") { _ in
+                    !CrashState.crashedLastLaunch
+                },
+            ]
+        ),
         keys: ReviewPromptStorageKeys(namespace: "reviewPrompt"),
         onEvent: { event in Analytics.track(event) }
     )
@@ -85,12 +89,18 @@ enum ReviewPrompt {
 }
 ```
 
+(Hand-assembling a conditions array is possible — that is what the standard
+policy does internally — but reserved for genuinely divergent products.)
+
 In the view layer (SwiftUI):
 
 ```swift
 @Environment(\.requestReview) private var requestReview
 
-.onChange(of: ReviewPrompt.engine.isEligible) { _, eligible in
+// `initial: true` is load-bearing: eligibility restored from a previous
+// launch (the pending flag persists) never produces a false→true transition,
+// so a default onChange would leave it stranded forever.
+.onChange(of: ReviewPrompt.engine.isEligible, initial: true) { _, eligible in
     guard eligible else { return }
     ReviewPrompt.scheduler.scheduleIfPossible(
         shouldRequest: { ReviewPrompt.engine.isEligible },
@@ -123,6 +133,11 @@ if let url = AppStoreReviewLink.writeReviewURL(appID: "1234567890") {
 > coordinated by your sheet system), call `scheduler.cancel()` and re-schedule
 > with fresh closures when it clears — captured `@Environment` values do not
 > track later updates. See the `ReviewRequestScheduler` doc comment.
+>
+> Eligibility is not consumed when a scheduling round gives up, so wire
+> *every* natural trigger point (view appear, blocking state cleared, next
+> significant event) to call `scheduleIfPossible` again — it is idempotent
+> while a round is in flight and cheap when nothing is pending.
 
 ## Migrating from an existing implementation
 
@@ -131,6 +146,13 @@ their counters and cooldown. A predecessor with a single undifferentiated
 action counter can alias every event name onto that key (the engine will not
 double-count when the event key equals the total key). See
 `StorageKeyMigrationTests` for a worked example.
+
+⚠️ The permanent single-counter alias is only sound when the app records
+**one** significant event going forward: with the alias in place, every named
+event feeds the same counter, so recording a second event name would inflate
+the core event's count. A host that wants multiple named events must instead
+do a one-time migration of the legacy value into distinct per-event/total
+keys and drop the alias.
 
 ## Requirements
 

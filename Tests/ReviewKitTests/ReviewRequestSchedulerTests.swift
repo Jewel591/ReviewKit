@@ -158,6 +158,26 @@ struct ReviewRequestSchedulerTests {
         #expect(requested)
     }
 
+    @Test func negativeMaxRetriesIsTreatedAsZeroRetriesInsteadOfTrapping() async {
+        let sleeper = ManualSleeper()
+        let scheduler = ReviewRequestScheduler(
+            configuration: .init(maxRetries: -1),
+            sleep: sleeper.sleep
+        )
+        var requested = false
+
+        scheduler.scheduleIfPossible(
+            shouldRequest: { true },
+            isBlocked: { false },
+            canRequestNow: { true },
+            request: { requested = true }
+        )
+        await sleeper.settle()
+        sleeper.resume()  // initial delay; single attempt, no retries, no trap
+        await sleeper.settle()
+        #expect(requested)
+    }
+
     @Test func fireTimeGateReValidatesEvenWhenScheduleTimeGatePassed() async {
         let sleeper = ManualSleeper()
         let scheduler = ReviewRequestScheduler(

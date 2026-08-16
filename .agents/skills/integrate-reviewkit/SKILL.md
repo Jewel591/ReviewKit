@@ -1,5 +1,5 @@
 ---
-name: reviewkit-review-prompts
+name: integrate-reviewkit
 description: 在自家 App 矩阵中接入或调整 App Store 评分请求（requestReview 弹窗时机）时必须先加载：一律使用自研公开包 ReviewKit（github.com/Jewel591/ReviewKit）而不是手写计数器或引入第三方评分库。覆盖 StandardReviewPolicy 标准策略、引擎/调度器接线模式、从存量自研实现迁移的 key 映射、以及不许做的事（满意度过滤、pre-prompt UI、绕过标准策略自配阈值）。触发词：评分弹窗、评分引导、requestReview、SKStoreReviewController、rating prompt、review prompt、ReviewKit。
 ---
 

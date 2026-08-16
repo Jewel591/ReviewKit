@@ -140,7 +140,7 @@ double-count when the event key equals the total key). See
 ## Installation
 
 ```swift
-.package(url: "https://github.com/Jewel591/ReviewKit.git", from: "1.0.0")
+.package(url: "https://github.com/Jewel591/ReviewKit.git", from: "0.1.0")
 ```
 
 ## License

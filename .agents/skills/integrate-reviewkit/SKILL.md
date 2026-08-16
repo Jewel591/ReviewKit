@@ -15,10 +15,12 @@ description: 在自家 App 矩阵中接入或调整 App Store 评分请求（req
 
 App 只提供两样：核心事件名 + App 特有抑制条件。阈值不许自配——`StandardReviewPolicy` 是全矩阵统一策略（装机 ≥7 天、启动 ≥5 次、核心事件 ≥10 次、冷却 120 天、每版本一次）。要改数值就改包里的 `StandardReviewPolicy`（这是全矩阵决策），不要在某个 App 里绕开预设手拼条件数组。
 
+工程构造用**模块限定名** `ReviewKit.ReviewRequestEngine(...)`——CI 的 `review-kit-lint` 以此为接入证据（防同名类型冒充），非限定写法会报未接入。
+
 ```swift
 @MainActor
 enum ReviewPrompt {
-    static let engine = ReviewRequestEngine(
+    static let engine = ReviewKit.ReviewRequestEngine(
         conditions: StandardReviewPolicy.conditions(
             coreEvent: "recordSaved",   // 本 App 的核心价值动作
             suppressors: [

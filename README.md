@@ -67,7 +67,9 @@ import ReviewKit
 
 @MainActor
 enum ReviewPrompt {
-    static let engine = ReviewRequestEngine(
+    // Module-qualified on purpose: the portfolio CI lint (review-kit-lint)
+    // uses `ReviewKit.ReviewRequestEngine(...)` as its adoption evidence.
+    static let engine = ReviewKit.ReviewRequestEngine(
         conditions: StandardReviewPolicy.conditions(
             coreEvent: "recordSaved",
             suppressors: [

@@ -65,6 +65,43 @@ enum ReviewPrompt {
 
 ⚠️ 调度轮重试耗尽**不消耗资格**，所以每个自然触发点（view appear、阻塞态解除、下一次核心事件）都要再调一次 `scheduleIfPossible`——它在途幂等、无 pending 时开销为零；只接一处 `onChange` 会让放弃的那轮永远搁浅。信号采集：冷启动一次 `recordSession()`；核心动作处 `recordSignificantEvent("recordSaved")`。
 
+和 SurfaceCoordinatorKit 一起用时：`isEligible` 只表示「可以成为候选」，不要在 `onChange` 里直接 `scheduleIfPossible` 绕过仲裁。SwiftUI 的 `onChange(initial: true)` 改去重新跑那一轮仲裁，只有 review 赢了才调度。UIKit 没有 `onChange`，从核心事件和信号解除处调度，但 `request` 里必须再 `arbitrate` 一次——延迟期间可能冒出更高优先级候选。
+
+## UIKit 宿主
+
+SwiftUI 用 `scenePhase` 和 `.requestReview`。UIKit 没有这两样，接线要换：
+
+```swift
+func scheduleReviewIfPossible(host: UIViewController) {
+    let host = host.tabBarController ?? host
+    ReviewPrompt.scheduler.scheduleIfPossible(
+        shouldRequest: { ReviewPrompt.engine.isEligible },
+        isBlocked: {
+            let scene = host.view.window?.windowScene
+            if scene?.activationState != .foregroundActive { return true }
+            return coordinator.isSignalActive("user-sheet-visible")
+                || coordinator.isSignalActive("settings-visible")
+                || coordinator.isSignalActive("paywall-visible")
+                || coordinator.isSignalActive("app-surface-visible")
+        },
+        hasBlockingPresentation: { host.presentedViewController != nil },
+        canRequestNow: { ReviewPrompt.engine.canRequestNow() },
+        request: {
+            guard coordinator.arbitrate([reviewCandidate]).winner?.id == reviewCandidate.id,
+                  let scene = host.view.window?.windowScene
+            else { return }
+            AppStore.requestReview(in: scene)
+            ReviewPrompt.engine.recordRequested()
+            coordinator.recordOutcome(.presented, for: reviewCandidate)
+        }
+    )
+}
+```
+
+`coordinator` 是宿主的 `SurfaceCoordinator`，信号 key 与 `reviewCandidate` 由宿主自己定。
+
+换根时 `scheduler.cancel()`，并清掉**这个 scene 贡献的**抑制信号后重新 OR-aggregate。⛔ 单 scene 的 `swapRoot` 不要调 `clearAllSignals()`——那是进程级拆台（登出、最后一个 window 关掉、替换每一个 scene 的 root）。将死的 host（`view.window == nil`）只清信号，不要当「阻塞解除」再 `scheduleIfPossible`。
+
 设置页固定加"给我们评分"入口（系统弹窗可能永远不出现）：
 
 ```swift

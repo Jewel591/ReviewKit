@@ -145,8 +145,9 @@ if let url = AppStoreReviewLink.writeReviewURL(appID: "1234567890") {
 > "may be a candidate". Do not schedule from `onChange` directly; put review
 > into `arbitrate` and schedule only if it wins. UIKit hosts have no
 > `scenePhase` / `requestReview` environment — use `windowScene`,
-> `presentedViewController`, and `AppStore.requestReview(in:)`. Cancel the
-> scheduler before replacing the window root.
+> `presentedViewController`, and `AppStore.requestReview(in:)`, and
+> re-arbitrate inside `request`. Cancel the scheduler before replacing a
+> window root; do not call `clearAllSignals()` for a single-scene swapRoot.
 
 ## Migrating from an existing implementation
 

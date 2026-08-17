@@ -65,6 +65,37 @@ enum ReviewPrompt {
 
 ⚠️ 调度轮重试耗尽**不消耗资格**，所以每个自然触发点（view appear、阻塞态解除、下一次核心事件）都要再调一次 `scheduleIfPossible`——它在途幂等、无 pending 时开销为零；只接一处 `onChange` 会让放弃的那轮永远搁浅。信号采集：冷启动一次 `recordSession()`；核心动作处 `recordSignificantEvent("recordSaved")`。
 
+和 SurfaceCoordinatorKit 一起用时：`isEligible` 只表示「可以成为候选」，不要在 `onChange` 里直接 `scheduleIfPossible` 绕过仲裁。先把 review 放进 `arbitrate` 的候选列表，只有赢了才调度；`onChange(initial: true)` 改去重新跑那一轮仲裁。
+
+## UIKit 宿主
+
+SwiftUI 用 `scenePhase` 和 `.requestReview`。UIKit 没有这两样，接线要换：
+
+```swift
+func scheduleReviewIfPossible(host: UIViewController) {
+    let host = host.tabBarController ?? host
+    ReviewPrompt.scheduler.scheduleIfPossible(
+        shouldRequest: { ReviewPrompt.engine.isEligible },
+        isBlocked: {
+            let scene = host.view.window?.windowScene
+            if scene?.activationState != .foregroundActive { return true }
+            return coordinator.isSignalActive("user-sheet-visible")
+                || coordinator.isSignalActive("settings-visible")
+        },
+        hasBlockingPresentation: { host.presentedViewController != nil },
+        canRequestNow: { ReviewPrompt.engine.canRequestNow() },
+        request: {
+            if let scene = host.view.window?.windowScene {
+                AppStore.requestReview(in: scene)
+                ReviewPrompt.engine.recordRequested()
+            }
+        }
+    )
+}
+```
+
+换根（`swapRoot` / 登出重建 window）时先 `scheduler.cancel()`，再 `coordinator.clearAllSignals()`。将死的 host 上不要再 `scheduleIfPossible`——`view.window == nil` 时只清信号，不要当一次「阻塞解除」去重调度。
+
 设置页固定加"给我们评分"入口（系统弹窗可能永远不出现）：
 
 ```swift

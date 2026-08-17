@@ -140,6 +140,13 @@ if let url = AppStoreReviewLink.writeReviewURL(appID: "1234567890") {
 > *every* natural trigger point (view appear, blocking state cleared, next
 > significant event) to call `scheduleIfPossible` again — it is idempotent
 > while a round is in flight and cheap when nothing is pending.
+>
+> When SurfaceCoordinatorKit is also in the app, `isEligible` only means
+> "may be a candidate". Do not schedule from `onChange` directly; put review
+> into `arbitrate` and schedule only if it wins. UIKit hosts have no
+> `scenePhase` / `requestReview` environment — use `windowScene`,
+> `presentedViewController`, and `AppStore.requestReview(in:)`. Cancel the
+> scheduler before replacing the window root.
 
 ## Migrating from an existing implementation
 

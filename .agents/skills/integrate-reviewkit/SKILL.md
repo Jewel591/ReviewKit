@@ -177,7 +177,10 @@ private func scheduleReviewIfPossible() {
             guard surfaceRuntime.arbitrateReviewIfEligible() else { return }
             requestReview()
             ReviewPrompt.engine.recordRequested()
-            surfaceRuntime.recordReviewPresented()
+            // Do not record SurfaceCoordinator `.presented`. requestReview()
+            // has no "was shown" callback; stamping presented burns the
+            // session interruption budget and can hide a later What's New
+            // or promo. ReviewKit already consumed eligibility on attempt.
         }
     )
 }
@@ -219,7 +222,8 @@ func scheduleReviewIfPossible(host: UIViewController) {
             else { return }
             AppStore.requestReview(in: scene)
             ReviewPrompt.engine.recordRequested()
-            coordinator.recordOutcome(.presented, for: reviewCandidate)
+            // Not `.presented`: the system may show nothing. Eligibility is
+            // already consumed by recordRequested().
         }
     )
 }
@@ -277,7 +281,9 @@ correctly by the new engine.
   policy name — that is a product decision, not a silent fork.
 - `requestReview()` has no "was shown" callback. `recordRequested()` stamps
   cooldown on **attempt**. Do not "fix" ignored system prompts by retrying
-  in the same version.
+  in the same version. Do not translate that attempt into SurfaceCoordinator
+  `.presented` — that outcome is only for a surface that actually appeared
+  and it spends the session interruption budget.
 - System hard cap: at most 3 displays per 365 days. Keep attempts rare;
   hang them after the win, never on launch or on the settings-button path.
 - Kits do not depend on AppContextKit. If the host already uses
@@ -295,6 +301,8 @@ Before declaring the integration complete:
       `initial: true`
 - [ ] review loses to (or waits behind) other app-initiated surfaces via
       `arbitrate`; settings "Rate this app" does not
+- [ ] a `requestReview()` attempt does not stamp SurfaceCoordinator
+      `.presented` (no "was shown" callback; do not burn the session budget)
 - [ ] observable blockers cancel the in-flight scheduler
 - [ ] settings write-review link uses the real numeric App Store ID
 - [ ] old counters / `ReviewPromptManager` / pre-prompt UI are deleted

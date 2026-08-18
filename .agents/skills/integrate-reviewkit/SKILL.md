@@ -149,7 +149,10 @@ enum ReviewPrompt {
 }
 ```
 
-SwiftUI — do not schedule from `onChange` until review wins arbitration:
+SwiftUI — do not schedule from `onChange` until review wins arbitration.
+`arbitrate` is side-effect free; call it again in `shouldRequest` and in
+`request`. A 1.5s delay is long enough for update / What's New / promo to
+become a better candidate.
 
 ```swift
 @Environment(\.requestReview) private var requestReview
@@ -162,10 +165,16 @@ SwiftUI — do not schedule from `onChange` until review wins arbitration:
 private func scheduleReviewIfPossible() {
     guard surfaceRuntime.arbitrateReviewIfEligible() else { return }
     ReviewPrompt.scheduler.scheduleIfPossible(
-        shouldRequest: { ReviewPrompt.engine.isEligible },
+        shouldRequest: {
+            ReviewPrompt.engine.isEligible
+                && surfaceRuntime.arbitrateReviewIfEligible()
+        },
         isBlocked: { scenePhase != .active || hostIsBlockingReview },
         canRequestNow: { ReviewPrompt.engine.canRequestNow() },
         request: {
+            // Re-check after the 1.5s delay: update / What's New / promo
+            // may have become a higher-priority candidate while we waited.
+            guard surfaceRuntime.arbitrateReviewIfEligible() else { return }
             requestReview()
             ReviewPrompt.engine.recordRequested()
             surfaceRuntime.recordReviewPresented()
@@ -233,10 +242,24 @@ a single undifferentiated action counter, alias both `significantEventKey`
 and `significantEventTotal` onto that key — the engine will not double-count
 when those two resolve to the same string.
 
-⚠️ Permanent aliasing is only sound when the app will record **one**
-significant event going forward. A second event name would inflate the same
-counter. Multiple named events need a one-time copy into distinct keys, then
-drop the alias. Copy the pattern in `Tests/ReviewKitTests/StorageKeyMigrationTests.swift`.
+`Tests/ReviewKitTests/StorageKeyMigrationTests.swift` only covers the
+**permanent single-counter alias**. Copy that pattern when the app will keep
+recording one event name.
+
+⚠️ Aliasing is only sound with one significant event going forward. A second
+event name would inflate the same counter. Multiple named events need a
+one-time copy into distinct keys **before the first new-engine init**, then
+construct `ReviewPromptStorageKeys` without the alias. There is no kit test
+for this path — write it in the host:
+
+```swift
+let legacyTotal = defaults.integer(forKey: "reviewPrompt_successfulActionCount")
+if defaults.object(forKey: "reviewPrompt_significantEvent_recordSaved") == nil {
+    defaults.set(legacyTotal, forKey: "reviewPrompt_significantEvent_recordSaved")
+    defaults.set(legacyTotal, forKey: "reviewPrompt_significantEventTotal")
+}
+```
+
 The host PR must include a test that a pre-kit UserDefaults fixture is read
 correctly by the new engine.
 

@@ -310,3 +310,10 @@ Before declaring the integration complete:
       namespaced default)
 - [ ] `review-kit-lint` is clean, and the checklist above is not "lint passed
       so we are done"
+
+## Host test boundary
+
+- Keep tests for the app's real legacy key migration, its one core-event mapping, composition-root `recordSession()` call, natural-trigger routing, and its SurfaceCoordinator policy.
+- `StandardReviewPolicy` thresholds, scheduler timing/cancellation, storage mechanics, and request throttling are ReviewKit contracts. Do not walk the same threshold table again in every app.
+- Do not read `project.pbxproj`, scan imports/source strings, or assert old type-file absence in XCTest; those structural checks belong to `review-kit-lint`.
+- Use isolated `UserDefaults`, fixed time and public APIs. Never invoke the real StoreKit review prompt in tests. Identical host helpers in two apps indicate a missing ReviewKit seam, not a reusable copy-ready test template.

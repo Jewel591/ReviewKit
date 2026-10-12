@@ -1,21 +1,22 @@
 ---
 name: integrate-reviewkit
-description: 在自家 App 矩阵中接入或调整 App Store 评分请求（requestReview 弹窗时机）时必须先加载：一律使用自研公开包 ReviewKit（github.com/Jewel591/ReviewKit）而不是手写计数器或引入第三方评分库。覆盖何时接入/不接入、核心事件怎么选、StandardReviewPolicy、引擎/调度器/SurfaceCoordinator 接线、recordSession 位置、从存量自研实现迁移的 key 映射、以及不许做的事（满意度过滤、pre-prompt UI、绕过标准策略自配阈值）。触发词：评分弹窗、评分引导、requestReview、SKStoreReviewController、rating prompt、review prompt、ReviewKit。
+description: 在自家 App 矩阵中接入或调整 App Store 评分请求（requestReview 弹窗时机）时必须先加载：一律使用自研公开包 ReviewKit（github.com/Jewel591/ReviewKit）而不是手写计数器或引入第三方评分库。覆盖何时接入/不接入、怎么选「用户最满意」的请求时机（offer(source:)）、reviewRequestHost 与 SurfaceCoordinator 接线、perform 的正确写法、埋点、从 0.x 迁移，以及不许做的事（统一累计门槛、满意度过滤、pre-prompt UI、启动时补弹）。触发词：评分弹窗、评分引导、requestReview、SKStoreReviewController、rating prompt、review prompt、ReviewKit。
 ---
 
 # Integrate ReviewKit
 
-Use ReviewKit as the app's only eligibility and timing engine for
-`requestReview()`. The Kit decides **whether** the app may ask and **when**
-to fire the platform call. The host keeps the win-event name, app-specific
-suppressors, the actual `requestReview()` / `AppStore.requestReview(in:)`,
-cross-surface arbitration, and the settings-page write-review link.
+Use ReviewKit 1.x as the app's only path to `requestReview()`. The **app**
+decides which moments are worth asking at and calls `offer(source:)` there.
+The **Kit** keeps attempts rare (fixed throttles), waits for a quiet moment,
+and makes the platform call through a single exit. The host keeps the moment
+choice and any app-specific "not now" rule, cross-surface arbitration inside
+`perform`, analytics, and the settings-page write-review link.
 
-⛔ Do not hand-write session/event/cooldown counters. ⛔ Do not add
+⛔ Do not hand-write cooldown counters or pending flags. ⛔ Do not add
 SiriusRating or another third-party rating SDK.
 
 ```swift
-.package(url: "https://github.com/Jewel591/ReviewKit.git", from: "0.1.0")
+.package(url: "https://github.com/Jewel591/ReviewKit.git", from: "1.0.0")
 ```
 
 ## Decide whether this app should adopt
@@ -40,280 +41,247 @@ Do **not** adopt when:
 - the only "iOS" code is a companion inside a Web-classified commercial repo
   that cannot submit yet.
 
-Thresholds live in `Sources/ReviewKit/StandardReviewPolicy.swift`. Changing a
-number is a portfolio-wide decision in that file, not a per-app override.
-
 ## Read the local contract
 
 Read this package `README.md` and the public declarations under
 `Sources/ReviewKit/` before writing host code. Do not reconstruct API names
-from memory. Doc comments on `ReviewRequestEngine` and
-`ReviewRequestScheduler` are the authoritative platform semantics
-(`requestReview()` has no "was shown" callback; cooldown stamps on attempt).
+from memory. Doc comments on `ReviewRequestEngine`, `ReviewRequestPolicy`
+and `reviewRequestHost` are the authoritative platform semantics.
 
 Also read and obey the target repository's `AGENTS.md` / `CLAUDE.md`. If the
-host already has SurfaceCoordinatorKit, read
-`integrate-surfacecoordinatorkit` before wiring the review candidate.
+host has SurfaceCoordinatorKit, read `integrate-surfacecoordinatorkit` before
+writing `perform`.
+
+## Choose the moments (the product decision)
+
+Apple shows the prompt at most 3 times per 365 days. Every attempt should land
+when the user is most satisfied, so the question is never "how many users can
+we reach" but "where is this user happiest".
+
+A good moment:
+
+- is a **final success** the user just achieved: a purchase whose
+  entitlement is active, a record saved, a project exported;
+- happens **after** the success UI settles (the host blocks during sheets,
+  celebrations and transitions; see below);
+- is not a launch, a first screen, a settings visit, an error recovery, or a
+  payment still in progress.
+
+Name each moment as a `ReviewRequestSource` — a short stable `snake_case`
+string such as `purchase` or `record_milestone`. It keys that source's
+cooldown and is the analytics `source` value; never rename a shipped one.
+
+Typical choices:
+
+- `purchase`: offer in the purchase **success** branch only (not cancelled,
+  pending, not-entitled, failed, or restore). Optionally require the user to
+  have used the product at least once — a first-launch purchase has not
+  experienced value yet; another moment can catch them later.
+- a usage milestone: count successes with `recordSignificantEvent`, then
+  offer once the count reaches the app's threshold (e.g. `>= 3`). Use `>=`,
+  not `==`: an offer that was blocked at the third success can be served at
+  the fourth, and the source cooldown keeps it to once a year.
+- Count **one user action once**: a batch that saves several records (AI
+  import, multi-select duplicate) is one success, not N. Count only after the
+  write committed, never on a failed or cancelled save.
+
+Throttles are fixed in `ReviewRequestPolicy` (14 days between any two
+attempts, 365 days per source, 180-second opportunity lifetime). They are not
+per-app knobs.
 
 ## Follow this workflow
 
 1. Inventory what the Kit will replace: `SKStoreReviewController` /
-   `requestReview()` call sites, hand-written session or "successful action"
-   counters, last-prompt dates, per-version flags, pre-prompt UI ("Enjoying
-   the app?"), and any "wait until paywall finished" gate that exists only
-   for ratings. List every UserDefaults key before writing code.
-2. Choose **one** core event name. It must be a completed value moment the
-   user can repeat (saved a record, saved a pickup, saved an app). It must
-   **not** be: process launch, first screen appear, opening settings, or the
-   user tapping "Rate this app". Record it only after the write/save
-   succeeded. If you cannot name that moment, stop — the product is not
-   ready for a rating prompt.
-3. Add the package (`https://github.com/Jewel591/ReviewKit`, up-to-next-major
-   `from:` / Xcode "Up to Next Major Version") to the **application** target.
-   Widgets and other extensions do not get this product. App / Xcode Cloud
-   may commit `Package.resolved`; that does not replace a compatible range
-   with an exact pin in the manifest.
-4. Scoring prompts are app-initiated surfaces. If the host does not already
-   have SurfaceCoordinatorKit, add it in the same change and follow
-   `integrate-surfacecoordinatorkit`. `isEligible` only means "may be a
-   candidate"; do not call `scheduleIfPossible` until review wins
-   `arbitrate`. `review-kit-lint` names this in its requirements text but
-   does not yet scan for `arbitrate` — passing the lint is not proof the
-   coordinator is wired.
-5. Construct one `ReviewKit.ReviewRequestEngine` with
-   `StandardReviewPolicy.conditions(coreEvent:suppressors:)`. The
-   module-qualified type name is the lint adoption evidence — an unqualified
-   `ReviewRequestEngine(...)` is reported as not integrated. New apps use
-   `ReviewPromptStorageKeys(namespace: "reviewPrompt")` (or the default
-   `reviewKit` namespace). Do not hand-assemble the standard gates.
-6. Host suppressors are allowed. The house convention after a marketing /
-   launch-paywall / promo surface is a **2-hour** `QuietPeriodCondition`
-   (not 24 hours). Add other `CustomReviewCondition`s only for states the
-   app already owns (crash-last-launch, onboarding, auth merge). Do not
-   invent suppressors the product does not have.
-7. Call `recordSession()` **exactly once per process start**, in the app
-   initializer or the same `startProcess()` that begins the surface session.
-   A session is one process start, not one foregrounding. ⛔ Do not call it
-   from `scenePhase` changes or `onAppear`.
-8. Call `recordSignificantEvent("<coreEvent>")` only on the success path of
-   that one win. Do not record on failure, undo, or duplicate-skipped saves
-   unless the product already treats that path as a completed win.
-9. Wire scheduling at **every** natural trigger: `onChange(of: isEligible,
-   initial: true)`, root `onAppear` / process start, blocking state clearing,
-   and the next core event. A scheduling round that exhausts retries does
-   **not** consume eligibility; a single `onChange` leaves restored pending
-   state stranded. `initial: true` is load-bearing because a pending flag
-   restored across launch never produces a false→true edge.
+   `requestReview()` call sites, hand-written counters, last-prompt dates,
+   per-version flags, pre-prompt UI, and any "wait until paywall finished"
+   gate that exists only for ratings. List every UserDefaults key first.
+2. Choose the moments (above). If you cannot name one, stop — the product is
+   not ready for a rating prompt.
+3. Add the package (up-to-next-major `from: "1.0.0"`) to the **application**
+   target only. App / Xcode Cloud may commit `Package.resolved`.
+4. Construct one `ReviewKit.ReviewRequestEngine` (module-qualified; that is
+   the lint adoption evidence). New apps use
+   `ReviewPromptStorageKeys(namespace: "reviewPrompt")` or the default.
+5. Write one host function per moment that calls `engine.offer(source:)`,
+   and route every call site of that moment through it. App-specific "not
+   now" rules live in that function as plain code (the Kit has no condition
+   types). House convention: skip non-purchase moments within **2 hours**
+   after a marketing / launch-paywall / promo surface; do not apply it to
+   `purchase` when that paywall itself is where purchases complete.
+6. Call those host functions on the final-success paths.
+7. Install `.reviewRequestHost(engine:isBlocked:hasBlockingPresentation:perform:)`
+   **once**, at the scene root. A non-active `scenePhase` is already handled
+   by the Kit. Get the two blocking inputs right (next section).
+8. Write `perform` correctly (next section).
+9. Send the analytics attempt event from the `.requestRecorded(source:)`
+   callback in `onEvent` — the single exit — never from call sites.
 10. Add the settings-page fallback with `AppStoreReviewLink.writeReviewURL
-    (appID:)`. The system prompt may never appear. This link is
-    user-initiated — it must **not** go through `arbitrate` or
-    `recordRequested()`.
-11. Delete the replaced in-house manager, counters, and pre-prompt UI in the
-    same change. Two eligibility engines are worse than either alone.
-12. Add the smallest host tests that prove: legacy keys (if any) are read by
-    the new engine; `recordSession` cannot run twice per process; the core
-    event is recorded only on the success path. Inject a dedicated
-    `UserDefaults(suiteName:)` and a fixed clock into the engine; never test
-    against `.standard` or real time. Kit-level behavior is already covered
-    in this package — do not re-test `StandardReviewPolicy` in the app.
-13. Run `review-kit-lint` (product-playbook). It checks the SPM range, a
-    production `import ReviewKit`, module-qualified
-    `ReviewKit.ReviewRequestEngine(...)`, and
-    `StandardReviewPolicy.conditions(...)`. It does not check session
-    placement, coordinator arbitration, extra trigger points, or the
-    settings link. Passing the lint is necessary, not sufficient.
+    (appID:)`. It is user-initiated: no arbitration, no `offer`.
+11. Delete the replaced in-house manager, counters and pre-prompt UI in the
+    same change.
+12. Add host tests (see the boundary below) and run `review-kit-lint`.
 
-## Host wiring (load-bearing)
+## Feed the blockers correctly (load-bearing)
 
-```swift
-@MainActor
-enum ReviewPrompt {
-    static let coreEvent = "recordSaved" // this app's win; change the name
-    static let appStoreID = "<numeric App Store ID>"
+The host re-schedules only when `isBlocked` **changes value**, and a running
+round reads the value captured when it was scheduled. So:
 
-    static let engine = ReviewKit.ReviewRequestEngine(
-        conditions: StandardReviewPolicy.conditions(
-            coreEvent: coreEvent,
-            suppressors: [
-                QuietPeriodCondition(
-                    identifier: "quietPeriod(marketingPrompt)",
-                    quietInterval: 2 * 3600,
-                    lastEventDate: { MarketingPrompts.lastShownDate }
-                ),
-            ]
-        ),
-        keys: ReviewPromptStorageKeys(namespace: "reviewPrompt"),
-        onEvent: { event in Logger.review.info("\(String(describing: event))") }
-    )
-    static let scheduler = ReviewRequestScheduler()
-}
-```
+- `isBlocked` must be built from **observable** state (`@Observable` /
+  `@State` / environment): lock screen, app-level sheet queue, surface
+  coordinator activity, launch checks (launch paywall, update check),
+  onboarding. A computed property that reads a plain singleton field or
+  `UserDefaults` never re-renders, so the host never learns the block
+  cleared and the opportunity expires silently.
+- State the host cannot observe (a UIKit `presentedViewController`, a
+  third-party overlay) goes into `hasBlockingPresentation`, which is
+  evaluated live at every attempt.
+- **Success overlays must report themselves.** A purchase celebration,
+  confetti or "done" animation that plays right after the win is exactly
+  where the prompt would land. Give the overlay an observable activity flag
+  set in its own `onAppear` / `onDisappear` (keyed per instance, so two
+  windows cannot clear each other) and OR it into `isBlocked`.
+- Block during UI tests, screenshot automation and demo runs, so automated
+  runs never call `requestReview()`.
+- Offering before dismissing the paywall is fine: the sheet blocks the host,
+  and the 1.5-second initial delay lets the next overlay appear before the
+  first attempt.
 
-SwiftUI — do not schedule from `onChange` until review wins arbitration.
-`arbitrate` is side-effect free; call it again in `shouldRequest` and in
-`request`. A 1.5s delay is long enough for update / What's New / promo to
-become a better candidate.
+## Write `perform` correctly (load-bearing)
+
+`perform` runs on the main actor at the moment the Kit decided to serve the
+opportunity. It must either call the platform API **synchronously** and
+return `true`, or return `false` without calling it.
 
 ```swift
 @Environment(\.requestReview) private var requestReview
 
-.onChange(of: ReviewPrompt.engine.isEligible, initial: true) { _, eligible in
-    guard eligible else { return }
-    scheduleReviewIfPossible()
-}
-
-private func scheduleReviewIfPossible() {
-    guard surfaceRuntime.arbitrateReviewIfEligible() else { return }
-    ReviewPrompt.scheduler.scheduleIfPossible(
-        shouldRequest: {
-            ReviewPrompt.engine.isEligible
-                && surfaceRuntime.arbitrateReviewIfEligible()
-        },
-        isBlocked: { scenePhase != .active || hostIsBlockingReview },
-        canRequestNow: { ReviewPrompt.engine.canRequestNow() },
-        request: {
-            // Re-check after the 1.5s delay: update / What's New / promo
-            // may have become a higher-priority candidate while we waited.
-            guard surfaceRuntime.arbitrateReviewIfEligible() else { return }
-            requestReview()
-            ReviewPrompt.engine.recordRequested()
-            // Do not record SurfaceCoordinator `.presented`. requestReview()
-            // has no "was shown" callback; stamping presented burns the
-            // session interruption budget and can hide a later What's New
-            // or promo. ReviewKit already consumed eligibility on attempt.
-        }
-    )
+content.reviewRequestHost(
+    engine: ReviewPrompt.engine,
+    isBlocked: isBlockingReviewPrompt,
+    hasBlockingPresentation: { hasPresentedUIKitController }
+) {
+    // SurfaceCoordinatorKit 1.x: an unobservable surface; the coordinator
+    // decides whether this moment may interrupt, and runs the call if so.
+    surfaceRuntime.requestReviewIfAllowed { requestReview() }
 }
 ```
 
-When an *observable* blocking state appears, `scheduler.cancel()` and
-re-schedule with fresh closures when it clears. Scheduler closures capture
-values at schedule time; `@Environment` inside a captured closure does not
-track later updates. A stale retry can burn the cooldown while the scene is
-inactive.
+- Return the arbiter's answer. `false` keeps the opportunity; the Kit retries
+  until its deadline. Only `true` stamps cooldowns.
+- ⛔ Do not call `engine` bookkeeping yourself — there is no
+  `recordRequested()` in 1.x. A host helper that used to call it must drop
+  that line.
+- ⛔ Do not report the attempt to SurfaceCoordinator as `.presented`.
+  `requestReview()` has no "was shown" callback; recording presented spends
+  the session interruption budget and can hide a later What's New or promo.
+- ⛔ Do not start a `Task` and return `true` before the call happened.
 
-UIKit has no `scenePhase` / `.requestReview`. Use `windowScene`,
-`presentedViewController`, and `AppStore.requestReview(in:)`. Re-arbitrate
-**inside** `request` — a higher-priority candidate may appear during the
-1.5s delay. On root swap: `scheduler.cancel()`, clear only this scene's
-suppression signals, then re-OR-aggregate. ⛔ Do not call
-`clearAllSignals()` for a single-scene `swapRoot`. A dying host
-(`view.window == nil`) only clears signals; do not treat that as "blocking
-cleared" and `scheduleIfPossible`.
+UIKit hosts (no `.requestReview` environment) may stay on 0.x until a UIKit
+host API exists, or drive `ReviewRequestScheduler.scheduleIfPossible(engine:
+isBlocked:hasBlockingPresentation:perform:)` directly with
+`AppStore.requestReview(in:)` inside `perform`, cancelling and re-scheduling
+on observable blocking changes.
+
+## Verify on device
+
+- Builds run from Xcode (development) show a test prompt on every request, so
+  you can see when a moment fires. It never submits a rating.
+- TestFlight builds never show the prompt; the request is a no-op.
+- App Store builds give the app no signal. Judge the rollout by the attempt
+  event and App Store Connect ratings, not by "I didn't see it".
+- To re-test a moment, delete the app (or clear the namespace keys); the
+  365-day source cooldown is otherwise working as designed.
+
+## Analytics
+
+Report attempts, not outcomes:
 
 ```swift
-func scheduleReviewIfPossible(host: UIViewController) {
-    let host = host.tabBarController ?? host
-    ReviewPrompt.scheduler.scheduleIfPossible(
-        shouldRequest: { ReviewPrompt.engine.isEligible },
-        isBlocked: {
-            let scene = host.view.window?.windowScene
-            if scene?.activationState != .foregroundActive { return true }
-            return coordinator.isSignalActive("user-sheet-visible")
-                || coordinator.isSignalActive("settings-visible")
-                || coordinator.isSignalActive("paywall-visible")
-                || coordinator.isSignalActive("app-surface-visible")
-        },
-        hasBlockingPresentation: { host.presentedViewController != nil },
-        canRequestNow: { ReviewPrompt.engine.canRequestNow() },
-        request: {
-            guard coordinator.arbitrate([reviewCandidate]).winner?.id == reviewCandidate.id,
-                  let scene = host.view.window?.windowScene
-            else { return }
-            AppStore.requestReview(in: scene)
-            ReviewPrompt.engine.recordRequested()
-            // Not `.presented`: the system may show nothing. Eligibility is
-            // already consumed by recordRequested().
-        }
-    )
+onEvent: { event in
+    if case .requestRecorded(let source) = event {
+        Analytics.capture("review_request_attempted", ["source": source.rawValue])
+    }
 }
 ```
 
-Settings fallback (user-initiated, no arbitration):
+Name and describe the event as an **attempt**. The app cannot know whether
+the prompt appeared or a rating was submitted; check ratings in App Store
+Connect. Register the event contract under the repository's analytics
+policy.
 
-```swift
-if let url = AppStoreReviewLink.writeReviewURL(appID: ReviewPrompt.appStoreID) {
-    Link("Rate this app", destination: url)
-}
-```
+## Migrating from 0.x
 
-## Migrating a shipped in-house implementation
+1.0 removes `StandardReviewPolicy`, the condition types
+(`ReviewRequestCondition`, `QuietPeriodCondition`, `CustomReviewCondition`,
+`ReviewRequestContext`), `recordSession()`, the per-version gate,
+`isEligible` and the persisted pending flag. A 0.x quiet-period suppressor
+becomes a plain check in the host's offer function. Migration contract:
 
-Storage keys are the upgrade contract: existing users must keep session
-counts, event totals, first-launch date, cooldown, and pending eligibility.
-Map `ReviewPromptStorageKeys` onto the historical keys. If the old code had
-a single undifferentiated action counter, alias both `significantEventKey`
-and `significantEventTotal` onto that key — the engine will not double-count
-when those two resolve to the same string.
+- Keep the success counter and last request date keys
+  (`significantEventTotal`, `significantEventKey`, `lastRequestDate`). A
+  single-counter alias (both mapped onto one legacy key) remains safe; the
+  engine does not double count.
+- Map `legacyPendingRequest` onto the old pending key. The engine writes
+  `false` on init; it never replays a stale pending request. No launch-time
+  catch-up offer.
+- Session count, first-launch date and last-request-version keys are no
+  longer read. Leave them; do not migrate them anywhere.
+- Source history starts empty. Do not attribute the old request to a source.
+- Existing users who already passed a usage milestone get their opportunity
+  at their next real success, not at launch.
+- Delete the old scheduler wiring (`onChange(of: isEligible)`, manual
+  `scheduleIfPossible` calls, cancel-on-block handlers) — the host modifier
+  owns it.
 
-`Tests/ReviewKitTests/StorageKeyMigrationTests.swift` only covers the
-**permanent single-counter alias**. Copy that pattern when the app will keep
-recording one event name.
-
-⚠️ Aliasing is only sound with one significant event going forward. A second
-event name would inflate the same counter. Multiple named events need a
-one-time copy into distinct keys **before the first new-engine init**, then
-construct `ReviewPromptStorageKeys` without the alias. There is no kit test
-for this path — write it in the host:
-
-```swift
-let legacyTotal = defaults.integer(forKey: "reviewPrompt_successfulActionCount")
-if defaults.object(forKey: "reviewPrompt_significantEvent_recordSaved") == nil {
-    defaults.set(legacyTotal, forKey: "reviewPrompt_significantEvent_recordSaved")
-    defaults.set(legacyTotal, forKey: "reviewPrompt_significantEventTotal")
-}
-```
-
-The host PR must include a test that a pre-kit UserDefaults fixture is read
-correctly by the new engine.
+Write a host test with the app's real legacy key fixture: init produces no
+opportunity, the counter is preserved, and the old request date still holds
+the 14-day gap.
 
 ## Preserve these boundaries
 
-- The engine answers "allowed to ask?"; the scheduler answers "fire now?".
-  Neither renders UI nor imports StoreKit.
-- Satisfaction routing (unhappy → feedback) belongs to the host or a support
-  module. It may *call* ReviewKit; ReviewKit must not grow a satisfaction
-  filter. "Only happy users see the prompt" violates App Store Guideline
-  5.6.1 in spirit.
-- ⛔ No pre-prompt UI ("Enjoying this app?").
-- ⛔ No per-app threshold knobs and no hand-built standard-gate array.
-  Genuinely divergent products assemble their own conditions under their own
-  policy name — that is a product decision, not a silent fork.
-- `requestReview()` has no "was shown" callback. `recordRequested()` stamps
-  cooldown on **attempt**. Do not "fix" ignored system prompts by retrying
-  in the same version. Do not translate that attempt into SurfaceCoordinator
-  `.presented` — that outcome is only for a surface that actually appeared
-  and it spends the session interruption budget.
-- System hard cap: at most 3 displays per 365 days. Keep attempts rare;
-  hang them after the win, never on launch or on the settings-button path.
-- Kits do not depend on AppContextKit. If the host already uses
-  `AppIdentity.current().marketingVersion`, passing it as `currentVersion`
-  is optional host wiring, not a ReviewKit requirement.
+- ⛔ No unified eligibility thresholds (install age, sessions, N successes)
+  added back in the Kit or copied into hosts as a gate before every offer.
+  A milestone is fine when it *is* the chosen moment.
+- ⛔ No launch-time offers, no settings-button offers, no offers before a
+  payment completes.
+- ⛔ No pre-prompt UI ("Enjoying this app?"), no satisfaction filter. "Only
+  happy users see the prompt" violates App Store Guideline 5.6.1 in spirit.
+- ⛔ No compensating retries for prompts the system did not show.
+- Kits do not depend on SurfaceCoordinatorKit or AppContextKit; arbitration
+  lives in the host's `perform`.
 
 ## Review the result
 
-Before declaring the integration complete:
-
-- [ ] `recordSession()` cannot run more than once per process and is not on
-      `onAppear` / `scenePhase`
-- [ ] the core event is recorded only after a successful win, under one name
-- [ ] every natural trigger calls `scheduleIfPossible`; `onChange` uses
-      `initial: true`
-- [ ] review loses to (or waits behind) other app-initiated surfaces via
-      `arbitrate`; settings "Rate this app" does not
-- [ ] a `requestReview()` attempt does not stamp SurfaceCoordinator
-      `.presented` (no "was shown" callback; do not burn the session budget)
-- [ ] observable blockers cancel the in-flight scheduler
+- [ ] every `offer(source:)` sits on a final-success path, not launch,
+      settings, failure or an in-progress payment
+- [ ] each moment's call sites go through one host function
+- [ ] `.reviewRequestHost` is installed once at the scene root, and
+      `isBlocked` covers app sheets, launch checks and success overlays
+- [ ] every input of `isBlocked` is observable; unobservable presentation
+      state is in `hasBlockingPresentation`
+- [ ] a batch success counts once, and only after the write committed
+- [ ] UI tests / screenshot automation are blocked
+- [ ] `perform` returns the arbiter's answer, calls the platform API
+      synchronously, and never records `.presented`
+- [ ] the attempt event is sent only from `.requestRecorded(source:)`
+- [ ] legacy keys are mapped and the pending key is never replayed
 - [ ] settings write-review link uses the real numeric App Store ID
-- [ ] old counters / `ReviewPromptManager` / pre-prompt UI are deleted
-- [ ] shipped users keep historical keys (or this is a new app with a
-      namespaced default)
-- [ ] `review-kit-lint` is clean, and the checklist above is not "lint passed
-      so we are done"
+- [ ] old manager / scheduler wiring / pre-prompt UI are deleted
+- [ ] `review-kit-lint` is clean, and this checklist is not "lint passed so
+      we are done"
 
 ## Host test boundary
 
-- Keep tests for the app's real legacy key migration, its one core-event mapping, composition-root `recordSession()` call, natural-trigger routing, and its SurfaceCoordinator policy.
-- `StandardReviewPolicy` thresholds, scheduler timing/cancellation, storage mechanics, and request throttling are ReviewKit contracts. Do not walk the same threshold table again in every app.
-- Do not read `project.pbxproj`, scan imports/source strings, or assert old type-file absence in XCTest; those structural checks belong to `review-kit-lint`.
-- Use isolated `UserDefaults`, fixed time and public APIs. Never invoke the real StoreKit review prompt in tests. Identical host helpers in two apps indicate a missing ReviewKit seam, not a reusable copy-ready test template.
+- Keep tests for: each moment offers only on its success path (and not on
+  cancel/failure), milestone counting, the real legacy key fixture, the
+  analytics mapping, and app-specific blockers.
+- Throttles, deadlines, cancel/re-schedule and the single request exit are
+  ReviewKit contracts. Do not re-test them in every app.
+- Do not read `project.pbxproj`, scan imports/source strings, or assert old
+  type-file absence in XCTest; structural checks belong to `review-kit-lint`.
+- Give each moment function defaulted parameters for the engine and anything
+  it reads (`UserDefaults`, now), and build the test engine through the same
+  factory the app uses, so tests exercise the real keys and analytics
+  mapping on an isolated suite.
+- Use isolated `UserDefaults`, fixed time and public APIs. Never invoke the
+  real StoreKit review prompt in tests.

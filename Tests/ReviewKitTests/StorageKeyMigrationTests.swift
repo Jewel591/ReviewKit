@@ -3,84 +3,85 @@ import Testing
 
 @testable import ReviewKit
 
-/// Verifies that a host migrating from an in-house implementation can map the
-/// kit onto its historical persistence keys so shipped users keep their
-/// counters and cooldowns. The key set below mirrors a real predecessor
-/// contract (single significant-event counter, legacy key names).
+/// Upgrading a shipped 0.x host (here: MONO's real predecessor key contract,
+/// one undifferentiated action counter) to 1.0.
 @MainActor
 struct StorageKeyMigrationTests {
     private static let legacyKeys = ReviewPromptStorageKeys(
-        sessionCount: "reviewPrompt_appSessionCount",
         significantEventTotal: "reviewPrompt_successfulActionCount",
-        firstLaunchDate: "reviewPrompt_firstLaunchDate",
         lastRequestDate: "reviewPrompt_lastReviewPromptDate",
-        lastRequestVersion: "reviewPrompt_lastRequestVersion",
-        pendingRequest: "reviewPrompt_pendingReviewRequest",
-        // Predecessor had one undifferentiated action counter: every named
-        // event maps onto the same legacy key (which is also the total).
-        significantEventKey: { _ in "reviewPrompt_successfulActionCount" }
+        legacyPendingRequest: "reviewPrompt_pendingReviewRequest",
+        significantEventKey: { _ in "reviewPrompt_successfulActionCount" },
+        sourceLastRequestDateKey: { "reviewPrompt_lastRequestDate_\($0.rawValue)" }
     )
 
-    @Test func legacyCountersAndCooldownSurviveMigration() {
+    /// State a 0.2.0 install leaves behind: counters, a pending flag that was
+    /// never served, an old request date and fields 1.0 no longer uses.
+    private static func legacyStore(lastRequestDaysAgo: Int, now: Date) -> InMemoryStore {
         let store = InMemoryStore()
-        let dateProvider = MutableDateProvider()
-
-        // State written by the predecessor implementation.
         store.set(12, forKey: "reviewPrompt_appSessionCount")
         store.set(30, forKey: "reviewPrompt_successfulActionCount")
-        store.set(dateProvider.now.addingTimeInterval(-40 * 86_400), forKey: "reviewPrompt_firstLaunchDate")
-        store.set(dateProvider.now.addingTimeInterval(-10 * 86_400), forKey: "reviewPrompt_lastReviewPromptDate")
-
-        let engine = ReviewRequestEngine(
-            conditions: [
-                MinimumSessionsCondition(sessions: 5),
-                MinimumSignificantEventsCondition(count: 20),
-                MinimumDaysSinceInstallCondition(days: 7),
-                CooldownCondition(days: 120),
-            ],
-            store: store,
-            keys: Self.legacyKeys,
-            currentVersion: "27.0.0",
-            dateProvider: dateProvider
+        store.set(now.addingTimeInterval(-400 * 86_400), forKey: "reviewPrompt_firstLaunchDate")
+        store.set(
+            now.addingTimeInterval(-Double(lastRequestDaysAgo) * 86_400),
+            forKey: "reviewPrompt_lastReviewPromptDate"
         )
-
-        // Counters and install date carried over; only the cooldown blocks.
-        engine.recordSession()
-        #expect(!engine.isEligible)
-        #expect(store.integer(forKey: "reviewPrompt_appSessionCount") == 13)
-
-        dateProvider.advance(days: 111)  // 121 days since last prompt
-        engine.recordSession()
-        #expect(engine.isEligible)
-    }
-
-    @Test func pendingFlagFromPredecessorIsHonored() {
-        let store = InMemoryStore()
+        store.set("2.3.0", forKey: "reviewPrompt_lastRequestVersion")
         store.set(true, forKey: "reviewPrompt_pendingReviewRequest")
-
-        let engine = ReviewRequestEngine(
-            conditions: [],
-            store: store,
-            keys: Self.legacyKeys,
-            currentVersion: "27.0.0"
-        )
-        #expect(engine.isEligible)
+        return store
     }
 
-    @Test func singleCounterMappingAggregatesAllNamedEvents() {
-        let store = InMemoryStore()
-        let engine = ReviewRequestEngine(
-            conditions: [MinimumSignificantEventsCondition(count: 3)],
-            store: store,
-            keys: Self.legacyKeys,
-            currentVersion: "27.0.0"
-        )
+    @Test func upgradeNeverReplaysTheLegacyPendingRequest() {
+        let clock = MutableDateProvider()
+        let store = Self.legacyStore(lastRequestDaysAgo: 200, now: clock.now)
 
-        engine.recordSignificantEvent("manualRecord")
-        engine.recordSignificantEvent("aiRecord", count: 2)
+        let engine = ReviewRequestEngine(store: store, keys: Self.legacyKeys, dateProvider: clock)
 
-        // Both event names land in the same legacy counter, which is also the
-        // total key. The engine must not double-count in that mapping.
-        #expect(store.integer(forKey: "reviewPrompt_successfulActionCount") == 3)
+        #expect(engine.pendingOpportunity == nil)
+        #expect(!engine.canRequestNow())
+        #expect(store.bool(forKey: "reviewPrompt_pendingReviewRequest") == false)
+    }
+
+    @Test func counterSurvivesAndKeepsCountingWithoutDoubleCounting() {
+        let clock = MutableDateProvider()
+        let store = Self.legacyStore(lastRequestDaysAgo: 200, now: clock.now)
+        let engine = ReviewRequestEngine(store: store, keys: Self.legacyKeys, dateProvider: clock)
+
+        #expect(engine.significantEventCount("recordSaved") == 30)
+        engine.recordSignificantEvent("recordSaved")
+        #expect(engine.significantEventCount("recordSaved") == 31)
+        #expect(store.integer(forKey: "reviewPrompt_successfulActionCount") == 31)
+    }
+
+    @Test func legacyRequestDateStillHoldsTheMinimumGap() {
+        let clock = MutableDateProvider()
+        let store = Self.legacyStore(lastRequestDaysAgo: 3, now: clock.now)
+        let engine = ReviewRequestEngine(store: store, keys: Self.legacyKeys, dateProvider: clock)
+
+        #expect(!engine.offer(source: "record_milestone"))
+        clock.advance(days: 11)
+        #expect(engine.offer(source: "record_milestone"))
+    }
+
+    @Test func sourceHistoryStartsEmpty() {
+        // The 0.x request had no source; it must not be attributed to one.
+        let clock = MutableDateProvider()
+        let store = Self.legacyStore(lastRequestDaysAgo: 20, now: clock.now)
+        let engine = ReviewRequestEngine(store: store, keys: Self.legacyKeys, dateProvider: clock)
+
+        #expect(engine.offer(source: "purchase"))
+        #expect(store.date(forKey: "reviewPrompt_lastRequestDate_purchase") == nil)
+    }
+
+    /// Default keys are part of the upgrade contract for apps adopting 1.x
+    /// fresh: renaming any of them resets counters and cooldowns.
+    @Test func namespacedDefaultKeysAreStable() {
+        let keys = ReviewPromptStorageKeys(namespace: "reviewPrompt")
+        #expect(keys.significantEventTotal == "reviewPrompt_significantEventTotal")
+        #expect(keys.lastRequestDate == "reviewPrompt_lastRequestDate")
+        #expect(keys.legacyPendingRequest == "reviewPrompt_pendingRequest")
+        #expect(keys.significantEventKey("recordSaved") == "reviewPrompt_significantEvent_recordSaved")
+        #expect(keys.sourceLastRequestDateKey("purchase") == "reviewPrompt_lastRequestDate_purchase")
+        #expect(ReviewPromptStorageKeys().lastRequestDate == "reviewKit_lastRequestDate")
     }
 }

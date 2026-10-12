@@ -1,44 +1,37 @@
 import Foundation
 
-/// Timing layer: decides *when to actually fire* a request the engine has
-/// already deemed eligible.
+/// Timing layer: serves the engine's pending opportunity at a quiet moment
+/// before its deadline.
 ///
-/// Why this exists: `requestReview()` should land in a quiet moment right
-/// after the app's success UI, but the moment eligibility is established the
-/// screen may be busy — transition animations, a local overlay the view layer
-/// cannot observe, an inactive scene. The scheduler applies an initial delay,
-/// re-checks every gate at fire time, and retries a bounded number of times
-/// while blocked. If retries run out, the eligibility (pending flag) is left
-/// intact for the next trigger point.
+/// Why this exists: the win moment is usually followed by success UI — a
+/// sheet dismissing, a celebration overlay, a transition. The scheduler
+/// applies an initial delay, re-checks every gate at fire time, and retries
+/// while blocked, but never past the opportunity's deadline. Cancelling and
+/// re-scheduling never extends that deadline.
 ///
-/// All gates are injected closures, re-evaluated live on every attempt.
+/// SwiftUI hosts should use
+/// ``SwiftUICore/View/reviewRequestHost(engine:isBlocked:hasBlockingPresentation:perform:)``,
+/// which owns a scheduler and the cancel/re-schedule wiring. Use this type
+/// directly only from UIKit hosts.
 ///
-/// Caveat for SwiftUI hosts: closures capture the caller's values at schedule
-/// time (views are value types; `@Environment` values in a captured closure do
-/// not track later updates). When an *observable* blocking state appears,
-/// `cancel()` the in-flight schedule and re-schedule with fresh closures once
-/// it clears — otherwise a long retry loop can fire against stale state and
-/// burn the cooldown while the app is not even active.
+/// Closures capture the caller's values at schedule time. When an observable
+/// blocking state appears, `cancel()` and re-schedule with fresh closures once
+/// it clears, so a retry never fires against stale state.
 @MainActor
 public final class ReviewRequestScheduler {
     public struct Configuration: Sendable {
-        /// Delay between eligibility and the first attempt, letting success
+        /// Delay between the offer and the first attempt, letting success
         /// UI/transitions settle so the prompt does not stomp on them.
         public var initialDelay: Duration
         /// Interval between retries while blocked.
         public var retryInterval: Duration
-        /// Maximum retries (excluding the first attempt). When exhausted the
-        /// round is abandoned; eligibility persists for the next trigger.
-        public var maxRetries: Int
 
         public init(
             initialDelay: Duration = .seconds(1.5),
-            retryInterval: Duration = .seconds(10),
-            maxRetries: Int = 18
+            retryInterval: Duration = .seconds(10)
         ) {
             self.initialDelay = initialDelay
             self.retryInterval = retryInterval
-            self.maxRetries = maxRetries
         }
     }
 
@@ -55,28 +48,25 @@ public final class ReviewRequestScheduler {
         self.sleep = sleep
     }
 
-    /// Schedules one request attempt round. Idempotent while a non-cancelled
-    /// round is in flight.
+    /// Schedules one attempt round for the engine's pending opportunity.
+    /// Idempotent while a non-cancelled round is in flight.
     ///
     /// - Parameters:
-    ///   - shouldRequest: pending-eligibility flag (must turn false once
-    ///     consumed or invalidated).
+    ///   - engine: owns the opportunity, its deadline and every gate.
     ///   - isBlocked: observable blocking state (scene inactive, screen
-    ///     locked, coordinator-managed overlay up...).
+    ///     locked, app-owned overlay up...).
     ///   - hasBlockingPresentation: fallback detection for presentation state
     ///     the observable layer cannot see (e.g. UIKit presentation chain).
-    ///   - canRequestNow: time-gate revalidation — wire to
-    ///     `ReviewRequestEngine.canRequestNow()`.
-    ///   - request: executed once all gates pass; the host calls the platform
-    ///     `requestReview()` here and then `engine.recordRequested()`.
+    ///   - perform: calls the platform `requestReview()` synchronously and
+    ///     returns `true`, or returns `false` without calling it. See
+    ///     ``ReviewRequestEngine/performRequest(_:)``.
     public func scheduleIfPossible(
-        shouldRequest: @escaping @MainActor () -> Bool,
+        engine: ReviewRequestEngine,
         isBlocked: @escaping @MainActor () -> Bool,
         hasBlockingPresentation: @escaping @MainActor () -> Bool = { false },
-        canRequestNow: @escaping @MainActor () -> Bool,
-        request: @escaping @MainActor () -> Void
+        perform: @escaping @MainActor () -> Bool
     ) {
-        guard shouldRequest(), !isBlocked() else { return }
+        guard engine.livePendingOpportunity() != nil, !isBlocked() else { return }
         if let task = inFlightTask, !task.isCancelled { return }
 
         generation += 1
@@ -93,21 +83,21 @@ public final class ReviewRequestScheduler {
 
             await sleep(configuration.initialDelay)
 
-            // Negative values would make the ClosedRange below trap; treat
-            // them as "no retries" instead of crashing at a distance from
-            // where the configuration was built.
-            let maxRetries = max(0, configuration.maxRetries)
+            while !Task.isCancelled {
+                guard let opportunity = engine.livePendingOpportunity() else { return }
 
-            for attempt in 0...maxRetries {
-                guard !Task.isCancelled, shouldRequest() else { return }
-
-                if !isBlocked(), !hasBlockingPresentation(), canRequestNow() {
-                    request()
+                if !isBlocked(), !hasBlockingPresentation(),
+                    engine.performRequest(perform)
+                {
                     return
                 }
 
-                guard attempt < maxRetries else { return }
-                await sleep(configuration.retryInterval)
+                let remaining = opportunity.deadline.timeIntervalSince(engine.now)
+                guard remaining > 0 else {
+                    engine.livePendingOpportunity()  // drops it and emits .expired
+                    return
+                }
+                await sleep(min(configuration.retryInterval, .seconds(remaining)))
             }
         }
     }

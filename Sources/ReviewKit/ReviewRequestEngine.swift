@@ -1,74 +1,66 @@
 import Foundation
 import Observation
 
-/// Eligibility engine: decides *whether the app is allowed to ask* for a
-/// review right now. It never presents UI and never calls StoreKit — the host
-/// observes `isEligible`, schedules the actual call (see
-/// ``ReviewRequestScheduler``), invokes the platform `requestReview()`, then
-/// reports back via ``recordRequested()``.
+/// Project-initiated review requests.
 ///
-/// Platform semantics worth internalizing: `requestReview()` has **no
-/// "was shown" callback**. Calling it only tells StoreKit you'd like the
-/// prompt; the system may silently ignore it (hard cap of 3 displays per 365
-/// days). The engine therefore stamps the cooldown on *attempt*, not display —
-/// an unanswered attempt still burns the local budget by design.
+/// The app decides *when* a moment is worth asking at and calls
+/// ``offer(source:)`` right after that win (purchase succeeded, third record
+/// saved...). The engine keeps the attempts rare (``ReviewRequestPolicy``)
+/// and holds at most one in-memory opportunity until
+/// a host (``SwiftUICore/View/reviewRequestHost(engine:isBlocked:hasBlockingPresentation:perform:)``
+/// or ``ReviewRequestScheduler``) finds a quiet moment to serve it.
+///
+/// Platform semantics worth internalizing: `requestReview()` has **no "was
+/// shown" callback**. The system may silently ignore the call (Apple caps
+/// displays at 3 per 365 days for a user who has not rated). Cooldowns are
+/// stamped on *attempt*, never on display, and an ignored attempt is never
+/// retried.
+///
+/// App-specific "not now" rules (a marketing prompt just showed, a celebration
+/// is playing) stay in the host: skip the ``offer(source:)`` call in the host
+/// function that owns the moment, or report the state through the host's
+/// `isBlocked`.
 @MainActor
 @Observable
 public final class ReviewRequestEngine {
-    /// True when all conditions passed and the request has not been consumed.
-    /// Persisted across launches until ``recordRequested()`` is called.
-    public private(set) var isEligible: Bool
+    /// The current opportunity, if any. In memory only: it never survives a
+    /// relaunch, and it is dropped once its deadline passes.
+    public private(set) var pendingOpportunity: ReviewOpportunity?
 
-    @ObservationIgnored private let conditions: [any ReviewRequestCondition]
     @ObservationIgnored private let store: any ReviewPromptStoring
     @ObservationIgnored private let keys: ReviewPromptStorageKeys
     @ObservationIgnored private let dateProvider: any ReviewDateProviding
-    @ObservationIgnored private let currentVersion: String
     @ObservationIgnored private let onEvent: ((ReviewKitEvent) -> Void)?
 
     /// - Parameters:
-    ///   - conditions: evaluated in order; all must pass. Order matters only
-    ///     for which gate gets reported in `blocked` events (first failure).
     ///   - store: persistence; defaults to `UserDefaults.standard`.
-    ///   - keys: key contract; customize to migrate from historical keys.
-    ///   - currentVersion: defaults to `CFBundleShortVersionString`.
+    ///   - keys: key contract; customize to keep shipped users' state.
     ///   - dateProvider: injectable clock.
     ///   - onEvent: analytics/diagnostics sink.
     public init(
-        conditions: [any ReviewRequestCondition],
         store: (any ReviewPromptStoring)? = nil,
         keys: ReviewPromptStorageKeys = ReviewPromptStorageKeys(),
-        currentVersion: String? = nil,
         dateProvider: any ReviewDateProviding = SystemReviewDateProvider(),
         onEvent: ((ReviewKitEvent) -> Void)? = nil
     ) {
-        self.conditions = conditions
         self.store = store ?? UserDefaultsReviewPromptStore()
         self.keys = keys
-        self.currentVersion =
-            currentVersion
-            ?? Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
-            ?? "unknown"
         self.dateProvider = dateProvider
         self.onEvent = onEvent
 
-        if !self.store.containsValue(forKey: keys.firstLaunchDate) {
-            self.store.set(dateProvider.now, forKey: keys.firstLaunchDate)
+        // 0.x persisted a pending request across launches. 1.0 opportunities
+        // come only from a fresh win moment, so a stale flag must never be
+        // replayed after an upgrade.
+        if self.store.bool(forKey: keys.legacyPendingRequest) {
+            self.store.set(false, forKey: keys.legacyPendingRequest)
         }
-        self.isEligible = self.store.bool(forKey: keys.pendingRequest)
     }
 
-    // MARK: - Signals in
+    // MARK: - Counters
 
-    /// Call once per cold start. The session itself may cross the last gate,
-    /// so eligibility is re-evaluated immediately after counting.
-    public func recordSession() {
-        store.set(store.integer(forKey: keys.sessionCount) + 1, forKey: keys.sessionCount)
-        evaluateEligibility()
-    }
-
-    /// Count one or more occurrences of a named significant event (a "win" —
-    /// the app's core value moment) and re-evaluate eligibility.
+    /// Count occurrences of a named success event. Hosts read the count back
+    /// with ``significantEventCount(_:)`` to decide on their own milestone
+    /// (e.g. "third successful save"). Counting never offers by itself.
     public func recordSignificantEvent(_ name: String, count: Int = 1) {
         guard count > 0 else { return }
         let eventKey = keys.significantEventKey(name)
@@ -81,74 +73,107 @@ public final class ReviewRequestEngine {
                 forKey: keys.significantEventTotal
             )
         }
-        evaluateEligibility()
     }
 
-    // MARK: - Decision points
-
-    /// Full evaluation pass. Called automatically by the record methods;
-    /// call directly when a host-side suppressor state changes (e.g. a quiet
-    /// period elapsed) and you want eligibility re-checked without new signals.
-    public func evaluateEligibility() {
-        guard !isEligible else { return }
-        let context = makeContext()
-        for condition in conditions {
-            let verdict = condition.evaluate(context)
-            if !verdict.isSatisfied {
-                onEvent?(.blocked(conditionID: condition.identifier, reason: verdict.reason))
-                return
-            }
-        }
-        store.set(true, forKey: keys.pendingRequest)
-        isEligible = true
-        onEvent?(.becameEligible)
+    public func significantEventCount(_ name: String) -> Int {
+        store.integer(forKey: keys.significantEventKey(name))
     }
 
-    /// Final check at the moment of the actual `requestReview()` call.
+    // MARK: - Opportunities
+
+    /// Offers a review opportunity for a win moment that just happened.
     ///
-    /// Requires established eligibility — this is a *revalidation*, not an
-    /// independent decision, so it can never approve a request that
-    /// ``evaluateEligibility()`` has not approved first. On top of that,
-    /// every condition that declared `revalidatesAtRequestTime` is re-run
-    /// against a fresh context, because eligibility and firing can be
-    /// arbitrarily far apart (the pending flag persists across launches).
-    public func canRequestNow() -> Bool {
-        guard isEligible else { return false }
-        let context = makeContext()
-        for condition in conditions where condition.revalidatesAtRequestTime {
-            let verdict = condition.evaluate(context)
-            if !verdict.isSatisfied {
-                onEvent?(.blocked(conditionID: condition.identifier, reason: verdict.reason))
+    /// Call only after the success is final (saved, purchased with the
+    /// entitlement active), never on launch or on a settings button. Returns
+    /// `true` when the opportunity was accepted; it is rejected when another
+    /// live opportunity is pending (first come, first served), a throttle is
+    /// still running.
+    @discardableResult
+    public func offer(source: ReviewRequestSource) -> Bool {
+        let now = dateProvider.now
+        if let pending = pendingOpportunity {
+            if pending.isExpired(at: now) {
+                expire(pending)
+            } else {
+                block(source, .pendingOpportunity, "opportunity from \(pending.source) still pending")
                 return false
             }
+        }
+        guard passesGates(for: source, now: now) else { return false }
+        pendingOpportunity = ReviewOpportunity(source: source, offeredAt: now)
+        onEvent?(.offered(source: source))
+        return true
+    }
+
+    /// Whether the pending opportunity may be served right now: present, not
+    /// expired, throttles clear. An expired opportunity is
+    /// dropped as a side effect.
+    public func canRequestNow() -> Bool {
+        guard let opportunity = livePendingOpportunity() else { return false }
+        return passesGates(for: opportunity.source, now: dateProvider.now)
+    }
+
+    /// The single request exit. Re-checks every gate, then runs `perform`,
+    /// which must call the platform `requestReview()` synchronously and
+    /// return `true`, or return `false` without calling it (e.g. a surface
+    /// arbiter refused). Only `true` stamps the cooldowns, consumes the
+    /// opportunity and emits ``ReviewKitEvent/requestRecorded(source:)``;
+    /// `false` leaves the opportunity for a retry before its deadline.
+    @discardableResult
+    public func performRequest(_ perform: () -> Bool) -> Bool {
+        guard canRequestNow(), let opportunity = pendingOpportunity else { return false }
+        guard perform() else { return false }
+        let now = dateProvider.now
+        store.set(now, forKey: keys.lastRequestDate)
+        store.set(now, forKey: keys.sourceLastRequestDateKey(opportunity.source))
+        pendingOpportunity = nil
+        onEvent?(.requestRecorded(source: opportunity.source))
+        return true
+    }
+
+    /// Returns the pending opportunity if it is still within its deadline,
+    /// dropping it otherwise.
+    @discardableResult
+    public func livePendingOpportunity() -> ReviewOpportunity? {
+        guard let opportunity = pendingOpportunity else { return nil }
+        guard !opportunity.isExpired(at: dateProvider.now) else {
+            expire(opportunity)
+            return nil
+        }
+        return opportunity
+    }
+
+    var now: Date { dateProvider.now }
+
+    // MARK: - Private
+
+    private func expire(_ opportunity: ReviewOpportunity) {
+        guard pendingOpportunity?.id == opportunity.id else { return }
+        pendingOpportunity = nil
+        onEvent?(.expired(source: opportunity.source))
+    }
+
+    private func passesGates(for source: ReviewRequestSource, now: Date) -> Bool {
+        if let last = store.date(forKey: keys.lastRequestDate),
+            now.timeIntervalSince(last) < ReviewRequestPolicy.minimumGap
+        {
+            block(source, .minimumGap, "last request \(Self.days(now, last)) days ago")
+            return false
+        }
+        if let last = store.date(forKey: keys.sourceLastRequestDateKey(source)),
+            now.timeIntervalSince(last) < ReviewRequestPolicy.sourceCooldown
+        {
+            block(source, .sourceCooldown, "\(source) requested \(Self.days(now, last)) days ago")
+            return false
         }
         return true
     }
 
-    /// Call immediately after invoking the platform `requestReview()`:
-    /// consumes the pending flag and stamps the cooldown + per-version anchors.
-    public func recordRequested() {
-        isEligible = false
-        store.set(false, forKey: keys.pendingRequest)
-        store.set(dateProvider.now, forKey: keys.lastRequestDate)
-        store.set(currentVersion, forKey: keys.lastRequestVersion)
-        onEvent?(.requestRecorded)
+    private func block(_ source: ReviewRequestSource, _ gate: ReviewRequestGate, _ reason: String) {
+        onEvent?(.blocked(source: source, gate: gate, reason: reason))
     }
 
-    // MARK: - Private
-
-    private func makeContext() -> ReviewRequestContext {
-        ReviewRequestContext(
-            now: dateProvider.now,
-            firstLaunchDate: store.date(forKey: keys.firstLaunchDate),
-            sessionCount: store.integer(forKey: keys.sessionCount),
-            totalSignificantEventCount: store.integer(forKey: keys.significantEventTotal),
-            lastRequestDate: store.date(forKey: keys.lastRequestDate),
-            lastRequestVersion: store.string(forKey: keys.lastRequestVersion),
-            currentVersion: currentVersion,
-            eventCountProvider: { [store, keys] name in
-                store.integer(forKey: keys.significantEventKey(name))
-            }
-        )
+    private static func days(_ now: Date, _ then: Date) -> Int {
+        Int(now.timeIntervalSince(then) / 86_400)
     }
 }

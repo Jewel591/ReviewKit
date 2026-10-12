@@ -41,10 +41,48 @@ final class EventRecorder {
         events.append(event)
     }
 
-    var blockedConditionIDs: [String] {
+    var blockedGates: [ReviewRequestGate] {
         events.compactMap {
-            if case .blocked(let id, _) = $0 { return id }
+            if case .blocked(_, let gate, _) = $0 { return gate }
             return nil
         }
     }
 }
+
+/// Resolves injected scheduler sleeps by hand; each resolved sleep advances
+/// the engine clock by the requested duration.
+@MainActor
+final class ManualSleeper {
+    private var pending: [(Duration, CheckedContinuation<Void, Never>)] = []
+    private(set) var sleepCount = 0
+    let clock: MutableDateProvider
+
+    init(clock: MutableDateProvider) {
+        self.clock = clock
+    }
+
+    func sleep(_ duration: Duration) async {
+        sleepCount += 1
+        await withCheckedContinuation { pending.append((duration, $0)) }
+    }
+
+    /// Elapses the oldest pending sleep.
+    func resume() {
+        guard !pending.isEmpty else { return }
+        let (duration, continuation) = pending.removeFirst()
+        let components = duration.components
+        clock.advance(
+            seconds: TimeInterval(components.seconds)
+                + TimeInterval(components.attoseconds) / 1e18
+        )
+        continuation.resume()
+    }
+
+    var hasPendingSleep: Bool { !pending.isEmpty }
+
+    /// Lets the scheduled Task reach its next suspension point.
+    func settle() async {
+        for _ in 0..<20 { await Task.yield() }
+    }
+}
+

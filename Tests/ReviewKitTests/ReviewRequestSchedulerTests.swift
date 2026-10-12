@@ -3,200 +3,186 @@ import Testing
 
 @testable import ReviewKit
 
-/// Deterministic scheduler tests: sleep is injected and resolved manually so
+/// Deterministic scheduler tests: sleep is injected and resolved manually, and
+/// each resolved sleep advances the engine clock by the requested duration, so
 /// no test depends on wall-clock time.
 @MainActor
 struct ReviewRequestSchedulerTests {
-    /// Controllable sleep: each call suspends until `resume()` releases it.
-    @MainActor
-    final class ManualSleeper {
-        private var continuations: [CheckedContinuation<Void, Never>] = []
-        private(set) var sleepCount = 0
+    private struct Harness {
+        let clock = MutableDateProvider()
+        let recorder = EventRecorder()
+        let engine: ReviewRequestEngine
+        let sleeper: ManualSleeper
+        let scheduler: ReviewRequestScheduler
 
-        func sleep(_: Duration) async {
-            sleepCount += 1
-            await withCheckedContinuation { continuations.append($0) }
-        }
-
-        func resume() {
-            guard !continuations.isEmpty else { return }
-            continuations.removeFirst().resume()
-        }
-
-        /// Lets the scheduled Task reach its next suspension point.
-        func settle() async {
-            for _ in 0..<20 { await Task.yield() }
+        @MainActor
+        init() {
+            let recorder = recorder
+            engine = ReviewRequestEngine(
+                store: InMemoryStore(),
+                dateProvider: clock,
+                onEvent: { recorder.record($0) }
+            )
+            sleeper = ManualSleeper(clock: clock)
+            scheduler = ReviewRequestScheduler(sleep: sleeper.sleep)
         }
     }
 
     @Test func firesAfterInitialDelayWhenAllGatesPass() async {
-        let sleeper = ManualSleeper()
-        let scheduler = ReviewRequestScheduler(sleep: sleeper.sleep)
-        var requested = false
+        let h = Harness()
+        var requested = 0
+        h.engine.offer(source: "purchase")
 
-        scheduler.scheduleIfPossible(
-            shouldRequest: { !requested },
-            isBlocked: { false },
-            canRequestNow: { true },
-            request: { requested = true }
-        )
-        await sleeper.settle()
-        #expect(!requested)
+        h.scheduler.scheduleIfPossible(engine: h.engine, isBlocked: { false }) {
+            requested += 1
+            return true
+        }
+        await h.sleeper.settle()
+        #expect(requested == 0)
 
-        sleeper.resume()  // initial delay elapses
-        await sleeper.settle()
-        #expect(requested)
+        h.sleeper.resume()  // initial delay elapses
+        await h.sleeper.settle()
+        #expect(requested == 1)
+        #expect(h.engine.pendingOpportunity == nil)
+    }
+
+    @Test func doesNothingWithoutAnOpportunity() async {
+        let h = Harness()
+        h.scheduler.scheduleIfPossible(engine: h.engine, isBlocked: { false }) { true }
+        await h.sleeper.settle()
+        #expect(h.sleeper.sleepCount == 0)
     }
 
     @Test func retriesWhileBlockedAndFiresOnceUnblocked() async {
-        let sleeper = ManualSleeper()
-        let scheduler = ReviewRequestScheduler(sleep: sleeper.sleep)
-        var blocked = true
+        let h = Harness()
+        var presenting = true
         var requested = false
+        h.engine.offer(source: "purchase")
 
-        scheduler.scheduleIfPossible(
-            shouldRequest: { !requested },
+        h.scheduler.scheduleIfPossible(
+            engine: h.engine,
             isBlocked: { false },
-            hasBlockingPresentation: { blocked },
-            canRequestNow: { true },
-            request: { requested = true }
-        )
-        await sleeper.settle()
-        sleeper.resume()  // initial delay; attempt 0 hits the blocker
-        await sleeper.settle()
+            hasBlockingPresentation: { presenting }
+        ) {
+            requested = true
+            return true
+        }
+        await h.sleeper.settle()
+        h.sleeper.resume()  // initial delay; attempt hits the blocker
+        await h.sleeper.settle()
         #expect(!requested)
 
-        blocked = false
-        sleeper.resume()  // retry interval elapses; attempt 1 fires
-        await sleeper.settle()
+        presenting = false
+        h.sleeper.resume()  // retry interval elapses
+        await h.sleeper.settle()
         #expect(requested)
     }
 
-    @Test func givesUpAfterMaxRetriesLeavingEligibilityIntact() async {
-        let sleeper = ManualSleeper()
-        let scheduler = ReviewRequestScheduler(
-            configuration: .init(maxRetries: 2),
-            sleep: sleeper.sleep
-        )
-        var stillPending = true
+    @Test func refusedPerformRetriesUntilAccepted() async {
+        let h = Harness()
+        var arbiterAllows = false
+        var calls = 0
+        h.engine.offer(source: "purchase")
+
+        h.scheduler.scheduleIfPossible(engine: h.engine, isBlocked: { false }) {
+            guard arbiterAllows else { return false }
+            calls += 1
+            return true
+        }
+        await h.sleeper.settle()
+        h.sleeper.resume()
+        await h.sleeper.settle()
+        #expect(calls == 0)
+        #expect(h.engine.pendingOpportunity != nil)
+
+        arbiterAllows = true
+        h.sleeper.resume()
+        await h.sleeper.settle()
+        #expect(calls == 1)
+        #expect(h.recorder.events.last == .requestRecorded(source: "purchase"))
+    }
+
+    @Test func blockedRoundStopsAtTheDeadlineAndExpires() async {
+        let h = Harness()
         var requested = false
+        h.engine.offer(source: "purchase")
 
-        scheduler.scheduleIfPossible(
-            shouldRequest: { stillPending },
-            isBlocked: { true },  // schedule-time guard passes only if unblocked
-            canRequestNow: { true },
-            request: { requested = true }
-        )
-        // Blocked at schedule time: nothing scheduled at all.
-        #expect(sleeper.sleepCount == 0)
-
-        scheduler.scheduleIfPossible(
-            shouldRequest: { stillPending },
+        h.scheduler.scheduleIfPossible(
+            engine: h.engine,
             isBlocked: { false },
-            hasBlockingPresentation: { true },
-            canRequestNow: { true },
-            request: { requested = true }
-        )
-        await sleeper.settle()
-        // initial delay + retries: attempts 0,1,2 then give up.
-        for _ in 0..<3 {
-            sleeper.resume()
-            await sleeper.settle()
+            hasBlockingPresentation: { true }
+        ) {
+            requested = true
+            return true
+        }
+        await h.sleeper.settle()
+        var rounds = 0
+        while h.sleeper.hasPendingSleep, rounds < 100 {
+            h.sleeper.resume()
+            await h.sleeper.settle()
+            rounds += 1
         }
         #expect(!requested)
-        #expect(stillPending)  // pending flag untouched — next trigger can retry
-        stillPending = false
+        #expect(h.engine.pendingOpportunity == nil)
+        #expect(h.recorder.events.last == .expired(source: "purchase"))
+        // 1.5s + ten 10s retries + a final short sleep reaches the 180s deadline.
+        #expect(rounds < 25)
+    }
+
+    @Test func cancelAndRescheduleDoesNotExtendTheDeadline() async {
+        let h = Harness()
+        var requested = false
+        h.engine.offer(source: "purchase")
+        let deadline = h.engine.pendingOpportunity!.deadline
+
+        h.scheduler.scheduleIfPossible(engine: h.engine, isBlocked: { false }) {
+            requested = true
+            return true
+        }
+        await h.sleeper.settle()
+        h.scheduler.cancel()
+        h.sleeper.resume()
+        await h.sleeper.settle()
+        #expect(!requested)
+
+        // Host stayed blocked past the deadline, then cleared.
+        h.clock.now = deadline
+        h.scheduler.scheduleIfPossible(engine: h.engine, isBlocked: { false }) {
+            requested = true
+            return true
+        }
+        await h.sleeper.settle()
+        #expect(h.sleeper.sleepCount == 1)  // nothing new was scheduled
+        #expect(!requested)
+        #expect(h.engine.pendingOpportunity == nil)
+    }
+
+    @Test func blockedAtScheduleTimeSchedulesNothing() async {
+        let h = Harness()
+        h.engine.offer(source: "purchase")
+
+        h.scheduler.scheduleIfPossible(engine: h.engine, isBlocked: { true }) { true }
+        await h.sleeper.settle()
+        #expect(h.sleeper.sleepCount == 0)
+        #expect(h.engine.pendingOpportunity != nil)
     }
 
     @Test func schedulingIsIdempotentWhileInFlight() async {
-        let sleeper = ManualSleeper()
-        let scheduler = ReviewRequestScheduler(sleep: sleeper.sleep)
+        let h = Harness()
         var requestCount = 0
+        h.engine.offer(source: "purchase")
 
         for _ in 0..<3 {
-            scheduler.scheduleIfPossible(
-                shouldRequest: { true },
-                isBlocked: { false },
-                canRequestNow: { true },
-                request: { requestCount += 1 }
-            )
+            h.scheduler.scheduleIfPossible(engine: h.engine, isBlocked: { false }) {
+                requestCount += 1
+                return true
+            }
         }
-        await sleeper.settle()
-        #expect(sleeper.sleepCount == 1)  // only one round in flight
+        await h.sleeper.settle()
+        #expect(h.sleeper.sleepCount == 1)
 
-        sleeper.resume()
-        await sleeper.settle()
+        h.sleeper.resume()
+        await h.sleeper.settle()
         #expect(requestCount == 1)
-    }
-
-    @Test func cancelStopsInFlightRoundAndAllowsRescheduling() async {
-        let sleeper = ManualSleeper()
-        let scheduler = ReviewRequestScheduler(sleep: sleeper.sleep)
-        var requested = false
-
-        scheduler.scheduleIfPossible(
-            shouldRequest: { !requested },
-            isBlocked: { false },
-            canRequestNow: { true },
-            request: { requested = true }
-        )
-        await sleeper.settle()
-        scheduler.cancel()
-        sleeper.resume()
-        await sleeper.settle()
-        #expect(!requested)
-
-        scheduler.scheduleIfPossible(
-            shouldRequest: { !requested },
-            isBlocked: { false },
-            canRequestNow: { true },
-            request: { requested = true }
-        )
-        await sleeper.settle()
-        sleeper.resume()
-        await sleeper.settle()
-        #expect(requested)
-    }
-
-    @Test func negativeMaxRetriesIsTreatedAsZeroRetriesInsteadOfTrapping() async {
-        let sleeper = ManualSleeper()
-        let scheduler = ReviewRequestScheduler(
-            configuration: .init(maxRetries: -1),
-            sleep: sleeper.sleep
-        )
-        var requested = false
-
-        scheduler.scheduleIfPossible(
-            shouldRequest: { true },
-            isBlocked: { false },
-            canRequestNow: { true },
-            request: { requested = true }
-        )
-        await sleeper.settle()
-        sleeper.resume()  // initial delay; single attempt, no retries, no trap
-        await sleeper.settle()
-        #expect(requested)
-    }
-
-    @Test func fireTimeGateReValidatesEvenWhenScheduleTimeGatePassed() async {
-        let sleeper = ManualSleeper()
-        let scheduler = ReviewRequestScheduler(
-            configuration: .init(maxRetries: 0),
-            sleep: sleeper.sleep
-        )
-        var canRequest = true
-        var requested = false
-
-        scheduler.scheduleIfPossible(
-            shouldRequest: { true },
-            isBlocked: { false },
-            canRequestNow: { canRequest },
-            request: { requested = true }
-        )
-        canRequest = false  // gate flips during the initial delay
-        await sleeper.settle()
-        sleeper.resume()
-        await sleeper.settle()
-        #expect(!requested)
     }
 }
